@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/gob"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -19,21 +20,22 @@ type (
 		msgserverch    chan Message
 		msgch          chan Message
 		done           chan os.Signal
-		servers        map[string]*Server
-		clients        map[string]*Client
-		addr           string
-		apex           bool
-		registered     bool
-		capacity       int
+		Servers        map[string]*Server
+		Clients        map[string]*Client
+		Addr           string
+		Apex           bool
+		Registered     bool
+		Capacity       int
 	}
 	Client struct {
 		parentServer *Server
 		con          net.Conn
-		addr         string
+		Addr         string
 	}
 	Message struct {
 		fromServer *Server
 		fromClient *Client
+		con        net.Conn
 		payload    []byte
 	}
 )
@@ -49,15 +51,15 @@ func NewServer(addr string, isApex bool) *Server {
 		msgserverch: make(chan Message),
 		msgch:       make(chan Message),
 		done:        make(chan os.Signal),
-		servers:     make(map[string]*Server),
-		clients:     make(map[string]*Client),
-		registered:  isApex,
-		apex:        isApex,
-		addr:        addr,
-		capacity:    DefaultCapacity,
+		Servers:     make(map[string]*Server),
+		Clients:     make(map[string]*Client),
+		Registered:  isApex,
+		Apex:        isApex,
+		Addr:        addr,
+		Capacity:    DefaultCapacity,
 	}
 	if !isApex {
-		s.servers[ApexAddr] = nil
+		s.Servers[ApexAddr] = &Server{Addr: ApexAddr, Capacity: DefaultCapacity}
 	}
 
 	return s
@@ -65,7 +67,7 @@ func NewServer(addr string, isApex bool) *Server {
 
 func (s *Server) Start() {
 	var err error
-	s.serverListener, err = net.Listen("tcp", s.addr)
+	s.serverListener, err = net.Listen("tcp", s.Addr)
 	if err != nil {
 		slog.Error("Could not start the server", "err", err)
 	}
@@ -86,7 +88,7 @@ func (s *Server) Start() {
 }
 
 func (s *Server) DialServer() {
-	if s.apex {
+	if s.Apex {
 		return
 	}
 
@@ -95,15 +97,21 @@ func (s *Server) DialServer() {
 		err error
 	)
 
-	for server := range s.servers {
+	for server := range s.Servers {
 		con, err = net.Dial("tcp", server)
 		if err == nil {
 			break
 		}
 	}
 
-	fmt.Fprintf(con, "\n%+v\n", s)
-	con.Close()
+	if con == nil {
+		return
+	}
+	encoder := gob.NewEncoder(con)
+	if err := encoder.Encode(*s); err != nil {
+		slog.Error("Could not serialize the server", "err", err)
+	}
+	defer con.Close()
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -116,13 +124,13 @@ func (s *Server) acceptServer() {
 		if err != nil {
 			break
 		}
-		s.handleServerConnection(con)
+		go s.handleServerConnection(con)
 	}
 }
 
 func (s *Server) handleServerConnection(con net.Conn) {
 	node := NewServer(con.RemoteAddr().String(), false)
-	s.servers[node.addr] = node
+	s.Servers[node.Addr] = node
 	buffer := make([]byte, 2048) // magic number?
 	for {
 		n, err := con.Read(buffer)
@@ -134,6 +142,7 @@ func (s *Server) handleServerConnection(con net.Conn) {
 		s.msgserverch <- Message{
 			fromServer: node,
 			fromClient: nil,
+			con:        con,
 			payload:    buffer[:n],
 		}
 
@@ -151,8 +160,16 @@ func (s *Server) handleServerConnection(con net.Conn) {
 func (s *Server) handleUserMessages() {}
 
 func (s *Server) handleServerMessage() {
+	var receivedServer Server
 	for msg := range s.msgserverch {
-		slog.Info("[server][msg]", "msg", string(msg.payload), "from", msg.fromServer.addr)
+		decoder := gob.NewDecoder(msg.con)
+		if err := decoder.Decode(receivedServer); err != nil {
+			slog.Error("Could not deserialize the server", "err", err)
+		}
+
+		fmt.Println("Received:", receivedServer)
+
+		// slog.Info("[server][msg]", "msg", string(msg.payload), "from", msg.fromServer.addr)
 	}
 }
 
@@ -166,6 +183,6 @@ func main() {
 	} else {
 		server = NewServer(AuxAddr, false)
 	}
-	slog.Info("Starting the server on", "addr", server.addr, "IsApex", server.apex)
+	slog.Info("Starting the server on", "addr", server.Addr, "IsApex", server.Apex)
 	server.Start()
 }
